@@ -240,10 +240,12 @@ Hier is geen stilte om op te knippen, dus knipt het programma op de officiële l
 |---|---|
 | `'python' is not recognized…` | Python is niet (goed) geïnstalleerd. Installeer het opnieuw en vink **"Add Python to PATH"** aan. |
 | `error: ffmpeg not found` | Installeer ffmpeg (zie [stap 1b](#1-eenmalig-installeren)) en open PowerShell opnieuw. |
-| `No module named 'mutagen'` | Voer `python -m pip install -r requirements.txt` uit. |
+| `the 'mutagen' package … is not installed for this Python` | Kopieer de installatieopdracht die in de melding staat en voer die uit. Die opdracht bevat het pad naar precies de Python die je gebruikt. Dat is belangrijk als je meerdere versies van Python op je computer hebt staan: een gewone `pip install` installeert dan soms in een andere versie. |
 | `error: input file not found` | Het pad klopt niet. Zet het tussen aanhalingstekens, of sleep het bestand naar het venster. |
 | `error: cannot tell the artist and album…` | Geef `--artist` en `--album` op, of hernoem het bestand naar `Artiest - Album.m4a`. |
-| `error: no release found in MusicBrainz…` | Controleer de spelling, of probeer de officiële albumtitel. Werkt het nog steeds niet, gebruik dan een [tracklijst](#het-album-staat-niet-in-musicbrainz-of-je-hebt-geen-internet). |
+| `Note : no exact match … using the closest: …` | De albumnaam in je tags wijkt iets af van die in MusicBrainz (bijvoorbeeld "Songs **from** …" tegenover "Songs **of** …"). Het programma gebruikt dan het album dat er het meest op lijkt. Controleer even of dat het juiste album is. |
+| `error: no release found in MusicBrainz…` | Ook een album met een sterk gelijkende naam is niet gevonden. Controleer de spelling, geef `--artist` en `--album` zelf op, of zoek het album op [musicbrainz.org](https://musicbrainz.org) en gebruik `--release-id`. Werkt het nog steeds niet, gebruik dan een [tracklijst](#het-album-staat-niet-in-musicbrainz-of-je-hebt-geen-internet). |
+| `note: no silences in the file` | Er zitten geen stiltes tussen de nummers (een live-album, of nummers die in elkaar overlopen), dus wordt er op de officiële lengtes geknipt. Zit er wat ruis in de pauzes? Probeer dan `--silence-db -30`. |
 | `cannot reach MusicBrainz` | Controleer je internetverbinding, of gebruik een tracklijst. |
 | `Cover : none in the Cover Art Archive` | Er is geen hoes van dit album beschikbaar. Je nummers zijn wel gewoon gemaakt. |
 | Vreemde tekens in de titels op het scherm | Alleen een weergaveprobleem van PowerShell. De bestanden zelf zijn in orde. |

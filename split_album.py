@@ -215,6 +215,39 @@ def search_releases(artist: str, album: str) -> list[dict]:
     return mb_get("release/", {"query": query, "limit": 25}).get("releases", [])
 
 
+# Loose search: minimum similarity (0..1) of title and artist with what was asked.
+FUZZY_MIN_TITLE = 0.75
+FUZZY_MIN_ARTIST = 0.75
+_LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
+
+
+def similarity(a: str, b: str) -> float:
+    from difflib import SequenceMatcher
+    norm = lambda s: re.sub(r"[\W_]+", " ", s.casefold().replace("’", "'")).strip()
+    return SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+def search_releases_fuzzy(artist: str, album: str) -> list[dict]:
+    """Search on the separate words, keep releases whose title and artist look alike.
+
+    For tags that differ a little from MusicBrainz ('Songs from ...' vs 'Songs of ...').
+    Best match first.
+    """
+    words = lambda s: " ".join(_LUCENE_SPECIAL.sub(r"\\\1", w) for w in s.split())
+    query = f"release:({words(album)}) AND artist:({words(artist)})"
+    found = mb_get("release/", {"query": query, "limit": 50}).get("releases", [])
+    scored = []
+    for r in found:
+        credit, _ = _credit(r.get("artist-credit", []))
+        t, a = similarity(r.get("title", ""), album), similarity(credit, artist)
+        if t >= FUZZY_MIN_TITLE and a >= FUZZY_MIN_ARTIST:
+            scored.append((round(t, 2), round(a, 2), r))
+    best = {}
+    for t, a, r in scored:
+        best.setdefault((t, a), []).append(r)
+    return [r for key in sorted(best, reverse=True) for r in rank_releases(best[key])]
+
+
 def rank_releases(candidates: list[dict]) -> list[dict]:
     """Best first: search score, then official, then album, then earliest date."""
     def key(r):
@@ -567,6 +600,17 @@ def cut_track(ffmpeg: str, src: str, dst: str, start: float, end: float, copy: b
 # --------------------------------------------------------------------------- #
 # Tags
 # --------------------------------------------------------------------------- #
+
+def check_mutagen():
+    """Stop early, with the exact install command, when mutagen is missing."""
+    try:
+        import mutagen  # noqa: F401
+    except ImportError:
+        exe = f'"{sys.executable}"' if " " in sys.executable else sys.executable
+        sys.exit("error: the 'mutagen' package (needed to write the tags) is not installed "
+                 f"for this Python ({sys.executable}).\nInstall it with:\n\n"
+                 f"    {exe} -m pip install mutagen\n")
+
 
 def tag_file(path: str, release: Release, track: Track, cover: bytes | None = None):
     if path.lower().endswith(".mp3"):
@@ -1297,7 +1341,15 @@ def choose_release(artist: str, album: str, duration: float | None) -> str:
     """Release ID of the edition that best fits the file; prints the choice."""
     candidates = rank_releases(search_releases(artist, album))
     if not candidates:
-        raise LookupError(f"no release found in MusicBrainz for '{artist}' - '{album}'")
+        candidates = search_releases_fuzzy(artist, album)
+        if candidates:
+            credit, _ = _credit(candidates[0].get("artist-credit", []))
+            print(f"Note  : no exact match for '{artist}' - '{album}'; using the closest: "
+                  f"'{credit}' - '{candidates[0].get('title')}'")
+    if not candidates:
+        raise LookupError(f"no release found in MusicBrainz for '{artist}' - '{album}'. "
+                          "Check the spelling, give --artist/--album yourself, or look the "
+                          "album up on musicbrainz.org and use --release-id")
 
     ranked, how = [], "best search match"
     if duration is not None:
@@ -1320,6 +1372,11 @@ def choose_release(artist: str, album: str, duration: float | None) -> str:
         for c in ranked[1:4]:
             print(f"    {describe_candidate(c, duration)}")
     return ranked[0]["id"]
+
+
+def source_name(release: Release) -> str:
+    """'MusicBrainz' or 'the tracklist', for messages."""
+    return release.source if release.id else f"the {release.source}"
 
 
 def lookup_release(artist: str | None, album: str | None, release_id: str | None,
@@ -1379,6 +1436,8 @@ def main(argv=None):
 
     if not os.path.isfile(args.input):
         sys.exit(f"error: input file not found: {args.input}")
+    if not args.dry_run:
+        check_mutagen()
 
     ffmpeg = find_ffmpeg()
     duration, codec = probe_audio(ffmpeg, args.input)
@@ -1421,7 +1480,7 @@ def main(argv=None):
     if diff is not None:
         total = release.total_length()
         msg = (f"the file is {fmt(abs(diff))} {'longer' if diff > 0 else 'shorter'} "
-               f"than the album in the {release.source} ({fmt(total)})")
+               f"than the album in {source_name(release)} ({fmt(total)})")
         if abs(diff) > MAX_MISMATCH_FRAC * total and not args.force:
             sys.exit(f"error: {msg}; probably the wrong edition or album. Pick another "
                      "with --release-id, or use --force to split anyway.")
@@ -1476,8 +1535,12 @@ def main(argv=None):
     if snap and n > 1:
         print(f"Cuts  : {meth_f.count('silence')} of {n - 1} moved to a silence "
               f"({len(silences)} silences found)")
+        if not silences:
+            print("note: no silences in the file (gapless or live album?); cutting at the "
+                  f"track lengths from {source_name(release)}. Try --silence-db -30 if the "
+                  "gaps between tracks hold some noise.", file=sys.stderr)
 
-    if args.order == "auto" and snap and not fixed_order and n >= 3 \
+    if args.order == "auto" and snap and silences and not fixed_order and n >= 3 \
             and meth_f.count("silence") < ORDER_CHECK_RATIO * (n - 1):
         print("Order : checking whether the file holds the tracks in another order...")
         identify = None

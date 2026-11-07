@@ -1019,3 +1019,78 @@ def test_end_to_end_txt_tracklist_snaps(tmp_path, monkeypatch):
     assert [t["start_seconds"] for t in data["tracks"]] == pytest.approx([0, 3.0, 8.0],
                                                                          abs=0.05)
     assert [t["cut"] for t in data["tracks"]] == ["silence", "silence", "end"]
+
+
+# --------------------------------------------------------------------------- #
+# Loose search when the tags differ slightly from MusicBrainz
+# --------------------------------------------------------------------------- #
+
+def test_similarity():
+    assert sa.similarity("Songs of Our Native Daughters",
+                         "Songs from Our Native Daughters") > 0.9
+    assert sa.similarity("Daughters", "Songs from Our Native Daughters") < 0.6
+    assert sa.similarity("Don’t Stop", "DON'T STOP!") == 1.0
+
+
+def test_search_releases_fuzzy_filters_and_ranks(monkeypatch):
+    queries = []
+
+    def fake_get(path, params):
+        queries.append(params["query"])
+        return {"releases": [
+            {"id": "other", "title": "Daughters", "score": 60,
+             "artist-credit": [{"name": "Daughters"}]},
+            {"id": "close", "title": "Songs of Our Native Daughters", "score": 100,
+             "status": "Official", "artist-credit": [{"name": "Our Native Daughters"}]},
+            {"id": "wrong-artist", "title": "Songs of Our Native Daughters", "score": 90,
+             "artist-credit": [{"name": "Someone Else"}]}]}
+
+    monkeypatch.setattr(sa, "mb_get", fake_get)
+    found = sa.search_releases_fuzzy("Our Native Daughters (feat. X)",
+                                     "Songs from Our Native Daughters")
+    assert [r["id"] for r in found] == ["close"]
+    # Lucene special characters are escaped, words are not quoted as one phrase
+    assert queries == ["release:(Songs from Our Native Daughters) AND "
+                       r"artist:(Our Native Daughters \(feat. X\))"]
+
+
+def test_choose_release_falls_back_to_fuzzy(monkeypatch, capsys):
+    def fake_get(path, params):
+        if path == "release/" and params["query"].startswith('release:"'):
+            return {"releases": []}                       # exact phrase: nothing
+        if path == "release/":
+            return {"releases": [{"id": "close", "title": "Songs of Our Native Daughters",
+                                  "score": 100, "artist-credit": [
+                                      {"name": "Our Native Daughters"}],
+                                  "release-group": {"id": "rg"}}]}
+        return {"release-count": 1, "releases": [browse_release("close", [600_000])]}
+
+    monkeypatch.setattr(sa, "mb_get", fake_get)
+    assert sa.choose_release("Our Native Daughters", "Songs from Our Native Daughters",
+                             600.0) == "close"
+    assert "no exact match" in capsys.readouterr().out
+
+
+def test_choose_release_nothing_similar(monkeypatch):
+    monkeypatch.setattr(sa, "mb_get", lambda path, params: {"releases": [
+        {"id": "x", "title": "Something Else", "artist-credit": [{"name": "Other"}]}]
+        if "release:(" in params["query"] else []})
+    with pytest.raises(LookupError, match="--release-id"):
+        sa.choose_release("Artist", "Album", 100.0)
+
+
+def test_missing_mutagen_stops_before_any_work(tmp_path, monkeypatch):
+    import builtins
+    real_import = builtins.__import__
+
+    def fake_import(name, *a, **k):
+        if name == "mutagen":
+            raise ImportError("No module named 'mutagen'")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", fake_import)
+    no_network(monkeypatch)
+    src = tmp_path / "album.m4a"
+    src.write_bytes(b"not audio")                      # never read: check comes first
+    with pytest.raises(SystemExit, match="-m pip install mutagen"):
+        sa.main([str(src), "--artist", "a", "--album", "b"])
