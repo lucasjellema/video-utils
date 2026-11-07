@@ -5,7 +5,8 @@ one file per track, with the right metadata on each file.
 
 Usage:
     python split_album.py INPUT --artist ARTIST --album ALBUM [--release-id MBID] [-o DIR]
-                          [--no-snap] [--snap-window S] [--silence-db DB] [--dry-run]
+                          [--no-snap] [--snap-window S] [--silence-db DB]
+                          [--no-cover] [--cover-size N] [--format md,csv,json] [--dry-run]
 
 python split_album.py "C:\Music\Pink Floyd - Wish You Were Here.m4a" --artist "Pink Floyd" --album "Wish You Were Here"
 
@@ -14,7 +15,8 @@ How it works:
        editions (releases) of the album, the one whose total length is closest
        to the duration of the file is used; ties go to the official, earliest
        edition. The runners-up are printed so you can force one with
-       --release-id.
+       --release-id. When even the best edition differs more than 5% in
+       length from the file, the script stops (--force splits anyway).
     2. Cut points: when the file and the edition differ in length by at most
        3%, the track lengths are scaled to fit. Each cut point is then moved to
        the middle of the nearest silence within --snap-window seconds (default
@@ -26,10 +28,16 @@ How it works:
     3. Cutting uses stream copy (no re-encoding, no quality loss) for AAC and
        MP3 input. Other codecs are re-encoded to AAC (.m4a, 256 kbit/s).
     4. Each track gets tags: title, artist, album artist, album, track and disc
-       number, year, genre and the MusicBrainz IDs.
-    5. tracks.md (overview: number, title, length, difference with the length
-       in MusicBrainz, how the end of the track was found, file name, start) is
-       written next to the tracks and printed to the console.
+       number, year, genre, the MusicBrainz IDs, a compilation flag for
+       various-artists albums, and the front cover from the Cover Art Archive
+       (also saved as cover.jpg; --no-cover to skip, --cover-size to choose
+       250, 500 (default), 1200 or full).
+       Multi-disc albums are expected as one file with all discs in order;
+       video discs (DVD, Blu-ray) of a release are ignored.
+    5. An overview (number, title, artist for compilations, length, difference
+       with the length in MusicBrainz, how the end of the track was found, file
+       name, start) is printed and written next to the tracks as tracks.md;
+       --format md,csv,json picks the file format(s).
 
 Output: <input folder>/<Artist>/<Year> - <Album>/NN - Title.ext
         (D-NN - Title.ext for multi-disc albums). Use -o to choose the folder.
@@ -63,8 +71,12 @@ USER_AGENT = "split_album/0.1 ( https://github.com/lucasjellema/video-utils )"
 DURATION_TOLERANCE_S = 5.0
 DURATION_TOLERANCE_FRAC = 0.01
 
+# Stop (unless --force) when file and album differ more than this fraction.
+MAX_MISMATCH_FRAC = 0.05
 # Scale the track lengths to the file when they differ at most this fraction.
 SCALE_MAX_FRAC = 0.03
+# Release groups (from the search results) whose editions are compared.
+MAX_RELEASE_GROUPS = 5
 # Silence detection: search this far (seconds) around each expected cut point,
 # for stretches quieter than SILENCE_DB lasting at least SILENCE_MIN_S.
 SNAP_WINDOW_S = 5.0
@@ -74,6 +86,13 @@ SILENCE_MIN_S = 0.3
 MIN_TRACK_S = 1.0
 # Max pages (each up to 100 releases) fetched when comparing editions.
 MAX_BROWSE_PAGES = 5
+
+CAA_API = "https://coverartarchive.org"
+COVER_SIZES = ("250", "500", "1200", "full")
+VARIOUS_ARTISTS_ID = "89ad4ac3-39f7-470e-963a-56509c546377"
+# Media with one of these words in their format hold video, not album audio.
+VIDEO_FORMAT_WORDS = ("dvd", "blu-ray", "vhs", "vcd", "laserdisc", "umd", "video")
+REPORT_FORMATS = ("md", "csv", "json")
 
 
 # --------------------------------------------------------------------------- #
@@ -102,6 +121,7 @@ class Release:
     genre: str
     release_group_id: str
     tracks: list[Track]
+    compilation: bool = False    # various artists
 
     @property
     def year(self) -> str:
@@ -209,9 +229,20 @@ def browse_group_releases(release_group_id: str) -> list[dict]:
     return releases
 
 
+def is_audio_medium(medium: dict) -> bool:
+    fmt_name = (medium.get("format") or "").lower()
+    return not any(word in fmt_name for word in VIDEO_FORMAT_WORDS)
+
+
+def audio_media(r: dict) -> list[dict]:
+    """The audio discs of a release (no DVD / Blu-ray), in disc order."""
+    return sorted((m for m in r.get("media", []) if is_audio_medium(m)),
+                  key=lambda m: m.get("position", 0))
+
+
 def release_length(r: dict) -> float | None:
-    """Total length (seconds) of a release from a browse result, if every track has one."""
-    lengths = [t.get("length") for m in r.get("media", []) for t in m.get("tracks", [])]
+    """Total audio length (seconds) of a release from a browse result, if every track has one."""
+    lengths = [t.get("length") for m in audio_media(r) for t in m.get("tracks", [])]
     if not lengths or any(not l for l in lengths):
         return None
     return sum(lengths) / 1000
@@ -255,13 +286,14 @@ def parse_release(data: dict) -> Release:
     genre = max(genres, key=lambda g: g.get("count", 0))["name"].title() if genres else ""
 
     tracks = []
-    for medium in sorted(data.get("media", []), key=lambda m: m.get("position", 0)):
+    # discs are numbered 1..n over the audio discs only (a DVD in a box set is skipped)
+    for disc, medium in enumerate(audio_media(data), 1):
         for t in medium.get("tracks", []):
             rec = t.get("recording", {})
             length_ms = t.get("length") or rec.get("length")
             t_artist, t_ids = _credit(t.get("artist-credit") or rec.get("artist-credit") or [])
             tracks.append(Track(
-                disc=medium.get("position", 1),
+                disc=disc,
                 number=t.get("position", len(tracks) + 1),
                 title=t.get("title") or rec.get("title", ""),
                 length=length_ms / 1000 if length_ms else None,
@@ -276,7 +308,50 @@ def parse_release(data: dict) -> Release:
     return Release(
         id=data["id"], title=data.get("title", ""), artist=artist, artist_ids=artist_ids,
         date=rg.get("first-release-date") or data.get("date") or "",
-        genre=genre, release_group_id=rg.get("id", ""), tracks=tracks)
+        genre=genre, release_group_id=rg.get("id", ""), tracks=tracks,
+        compilation=(VARIOUS_ARTISTS_ID in artist_ids
+                     or ("Compilation" in rg.get("secondary-types", [])
+                         and len({t.artist for t in tracks}) > 1)))
+
+
+# --------------------------------------------------------------------------- #
+# Cover art (Cover Art Archive)
+# --------------------------------------------------------------------------- #
+
+def http_get_bytes(url: str) -> bytes | None:
+    """GET a URL (following redirects); None on 404."""
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        raise RuntimeError(f"download failed ({exc.code}): {url}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"cannot reach {url}: {exc.reason}") from exc
+
+
+def image_type(data: bytes) -> str | None:
+    """'jpeg' or 'png' from the file signature, else None."""
+    if data.startswith(b"\xff\xd8\xff"):
+        return "jpeg"
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    return None
+
+
+def fetch_cover(release: Release, size: str = "500") -> bytes | None:
+    """Front cover of the release, else of the release group; None when there is none."""
+    suffix = "front" if size == "full" else f"front-{size}"
+    urls = [f"{CAA_API}/release/{release.id}/{suffix}"]
+    if release.release_group_id:
+        urls.append(f"{CAA_API}/release-group/{release.release_group_id}/{suffix}")
+    for url in urls:
+        data = http_get_bytes(url)
+        if data and image_type(data):
+            return data
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -461,11 +536,11 @@ def cut_track(ffmpeg: str, src: str, dst: str, start: float, end: float, copy: b
 # Tags
 # --------------------------------------------------------------------------- #
 
-def tag_file(path: str, release: Release, track: Track):
+def tag_file(path: str, release: Release, track: Track, cover: bytes | None = None):
     if path.lower().endswith(".mp3"):
-        _tag_mp3(path, release, track)
+        _tag_mp3(path, release, track, cover)
     else:
-        _tag_mp4(path, release, track)
+        _tag_mp4(path, release, track, cover)
 
 
 def _mb_ids(release: Release, track: Track) -> dict[str, str]:
@@ -479,8 +554,8 @@ def _mb_ids(release: Release, track: Track) -> dict[str, str]:
     return {k: v for k, v in ids.items() if v}
 
 
-def _tag_mp4(path: str, release: Release, track: Track):
-    from mutagen.mp4 import MP4, MP4FreeForm
+def _tag_mp4(path: str, release: Release, track: Track, cover: bytes | None):
+    from mutagen.mp4 import MP4, MP4Cover, MP4FreeForm
 
     audio = MP4(path)
     if audio.tags is None:
@@ -501,12 +576,17 @@ def _tag_mp4(path: str, release: Release, track: Track):
         ids["MusicBrainz Track Id"] = track.recording_id
     for name, value in ids.items():
         tags[f"----:com.apple.iTunes:{name}"] = [MP4FreeForm(value.encode("utf-8"))]
+    if release.compilation:
+        tags["cpil"] = True
+    if cover and image_type(cover):
+        kind = MP4Cover.FORMAT_PNG if image_type(cover) == "png" else MP4Cover.FORMAT_JPEG
+        tags["covr"] = [MP4Cover(cover, imageformat=kind)]
     audio.save()
 
 
-def _tag_mp3(path: str, release: Release, track: Track):
-    from mutagen.id3 import (ID3, ID3NoHeaderError, TALB, TCON, TDRC, TIT2, TPE1,
-                             TPE2, TPOS, TRCK, TXXX, UFID)
+def _tag_mp3(path: str, release: Release, track: Track, cover: bytes | None):
+    from mutagen.id3 import (APIC, ID3, ID3NoHeaderError, TALB, TCMP, TCON, TDRC, TIT2,
+                             TPE1, TPE2, TPOS, TRCK, TXXX, UFID)
 
     try:
         tags = ID3(path)
@@ -528,6 +608,11 @@ def _tag_mp3(path: str, release: Release, track: Track):
         tags.add(TXXX(encoding=3, desc=name, text=value))
     if track.recording_id:
         tags.add(UFID(owner="http://musicbrainz.org", data=track.recording_id.encode()))
+    if release.compilation:
+        tags.add(TCMP(encoding=3, text="1"))
+    if cover and image_type(cover):
+        tags.add(APIC(encoding=3, mime=f"image/{image_type(cover)}", type=3,
+                      desc="Cover", data=cover))
     tags.save(path, v2_version=4)
 
 
@@ -540,17 +625,23 @@ def track_label(track: Track, multi_disc: bool) -> str:
 
 
 def build_rows(release: Release, segments, filenames, methods=None) -> list[dict]:
+    """One row per track: display strings for the tables plus raw values for csv/json."""
     multi = release.disc_count > 1
     methods = methods or ["metadata"] * len(segments)
     rows = []
     for t, (s, e), f, m in zip(release.tracks, segments, filenames, methods):
         if t.length is None:
-            delta = ""
+            delta, delta_s = "", None
         else:
-            d = round((e - s) - t.length, 1)
+            delta_s = round((e - s) - t.length, 3)
+            d = round(delta_s, 1)
             delta = "0.0s" if d == 0 else f"{d:+.1f}s"
-        rows.append({"nr": track_label(t, multi), "title": t.title, "length": fmt(e - s),
-                     "delta": delta, "cut": m, "file": f, "start": fmt(s)})
+        rows.append({"nr": track_label(t, multi), "title": t.title, "artist": t.artist,
+                     "length": fmt(e - s), "delta": delta, "cut": m, "file": f,
+                     "start": fmt(s),
+                     # raw values
+                     "track": t, "start_s": round(float(s), 3), "end_s": round(float(e), 3),
+                     "delta_s": delta_s})
     return rows
 
 
@@ -560,23 +651,36 @@ COLUMNS = [("nr", "#"), ("title", "Title"), ("length", "Length"), ("delta", "Δ 
            ("cut", "Cut"), ("file", "File"), ("start", "Start")]
 
 
-def console_table(rows: list[dict]) -> str:
-    widths = {k: max(len(h), *(len(r[k]) for r in rows)) for k, h in COLUMNS}
-    line = lambda vals: "  ".join(v.ljust(widths[k]) for (k, _), v in zip(COLUMNS, vals))
-    out = [line([h for _, h in COLUMNS]), line(["-" * widths[k] for k, _ in COLUMNS])]
-    out += [line([r[k] for k, _ in COLUMNS]) for r in rows]
+def columns_for(release: Release) -> list[tuple[str, str]]:
+    """COLUMNS, plus an Artist column when tracks have different artists."""
+    if release.compilation or any(t.artist != release.artist for t in release.tracks):
+        return COLUMNS[:2] + [("artist", "Artist")] + COLUMNS[2:]
+    return COLUMNS
+
+
+def console_table(rows: list[dict], columns=COLUMNS) -> str:
+    widths = {k: max(len(h), *(len(r[k]) for r in rows)) for k, h in columns}
+    line = lambda vals: "  ".join(v.ljust(widths[k]) for (k, _), v in zip(columns, vals))
+    out = [line([h for _, h in columns]), line(["-" * widths[k] for k, _ in columns])]
+    out += [line([r[k] for k, _ in columns]) for r in rows]
     return "\n".join(out)
 
 
-def markdown_report(release: Release, rows: list[dict], source: str, duration: float) -> str:
+def markdown_report(release: Release, rows: list[dict], source: str, duration: float,
+                    columns=COLUMNS, cover_file: str | None = None) -> str:
     esc = lambda s: s.replace("|", "\\|")
     lines = [f"# {release.artist} - {release.title}", ""]
+    if cover_file:
+        lines += [f"![cover]({urllib.parse.quote(cover_file)})", ""]
     if release.date:
         lines.append(f"- Year: {release.year}")
     if release.genre:
         lines.append(f"- Genre: {release.genre}")
-    lines += [f"- Tracks: {len(rows)}, total {fmt(duration)}",
-              f"- Source: `{os.path.basename(source)}`",
+    discs = f" on {release.disc_count} discs" if release.disc_count > 1 else ""
+    lines += [f"- Tracks: {len(rows)}{discs}, total {fmt(duration)}"]
+    if release.compilation:
+        lines.append("- Compilation (various artists)")
+    lines += [f"- Source: `{os.path.basename(source)}`",
               f"- MusicBrainz release: https://musicbrainz.org/release/{release.id}",
               "",
               "Δ MB: length in the file minus the length in MusicBrainz. "
@@ -584,10 +688,83 @@ def markdown_report(release: Release, rows: list[dict], source: str, duration: f
               "silence, scaled = track lengths scaled to the file, metadata = track "
               "length from MusicBrainz, end = end of the file).",
               "",
-              "| " + " | ".join(h for _, h in COLUMNS) + " |",
-              "|" + "|".join("---" for _ in COLUMNS) + "|"]
-    lines += ["| " + " | ".join(esc(r[k]) for k, _ in COLUMNS) + " |" for r in rows]
+              "| " + " | ".join(h for _, h in columns) + " |",
+              "|" + "|".join("---" for _ in columns) + "|"]
+    lines += ["| " + " | ".join(esc(r[k]) for k, _ in columns) + " |" for r in rows]
     return "\n".join(lines) + "\n"
+
+
+CSV_FIELDS = ["disc", "number", "title", "artist", "length", "length_seconds", "start",
+              "start_seconds", "musicbrainz_length_seconds", "delta_seconds", "cut", "file"]
+
+
+def track_record(row: dict) -> dict:
+    t = row["track"]
+    return {"disc": t.disc, "number": t.number, "title": t.title, "artist": t.artist,
+            "length": row["length"], "length_seconds": round(row["end_s"] - row["start_s"], 3),
+            "start": row["start"], "start_seconds": row["start_s"],
+            "end_seconds": row["end_s"], "musicbrainz_length_seconds": t.length,
+            "delta_seconds": row["delta_s"], "cut": row["cut"], "file": row["file"],
+            "musicbrainz_recording_id": t.recording_id or None,
+            "musicbrainz_track_id": t.track_id or None}
+
+
+def csv_report(rows: list[dict]) -> str:
+    import csv
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=CSV_FIELDS, extrasaction="ignore",
+                            lineterminator="\n")
+    writer.writeheader()
+    for row in rows:
+        rec = track_record(row)
+        writer.writerow({k: "" if rec[k] is None else rec[k] for k in CSV_FIELDS})
+    return buf.getvalue()
+
+
+def json_report(release: Release, rows: list[dict], source: str, duration: float,
+                cover_file: str | None = None) -> str:
+    data = {
+        "album": {
+            "artist": release.artist, "title": release.title, "date": release.date or None,
+            "year": release.year or None, "genre": release.genre or None,
+            "compilation": release.compilation, "discs": release.disc_count,
+            "tracks": len(rows), "duration_seconds": round(duration, 3),
+            "source": os.path.basename(source), "cover": cover_file,
+            "musicbrainz_release_id": release.id,
+            "musicbrainz_release_group_id": release.release_group_id or None,
+        },
+        "tracks": [track_record(r) for r in rows],
+    }
+    return json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+
+
+def write_reports(outdir: str, formats: list[str], release: Release, rows: list[dict],
+                  source: str, duration: float, cover_file: str | None) -> list[str]:
+    columns = columns_for(release)
+    content = {
+        "md": lambda: markdown_report(release, rows, source, duration, columns, cover_file),
+        "csv": lambda: csv_report(rows),
+        "json": lambda: json_report(release, rows, source, duration, cover_file),
+    }
+    paths = []
+    for f in formats:
+        path = os.path.join(outdir, f"tracks.{f}")
+        # BOM for csv so Excel reads it as UTF-8
+        with open(path, "w", encoding="utf-8-sig" if f == "csv" else "utf-8",
+                  newline="") as fh:
+            fh.write(content[f]())
+        paths.append(path)
+    return paths
+
+
+def parse_formats(text: str) -> list[str]:
+    formats = [f.strip().lower() for f in text.split(",") if f.strip()]
+    bad = [f for f in formats if f not in REPORT_FORMATS]
+    if bad or not formats:
+        raise argparse.ArgumentTypeError(
+            f"unknown format {', '.join(bad) or '(none)'}; choose from {', '.join(REPORT_FORMATS)}")
+    return list(dict.fromkeys(formats))
 
 
 # --------------------------------------------------------------------------- #
@@ -602,14 +779,14 @@ def choose_release(artist: str, album: str, duration: float | None) -> str:
 
     ranked, how = [], "best search match"
     if duration is not None:
-        # all editions of the best-matching release group(s)
-        top = candidates[0].get("score")
+        # all editions of the best-matching release groups (compilation series
+        # often have a separate release group per country)
         groups = []
         for c in candidates:
             rg = c.get("release-group", {}).get("id")
-            if c.get("score") == top and rg and rg not in groups:
+            if rg and rg not in groups:
                 groups.append(rg)
-        pool = [r for rg in groups[:3] for r in browse_group_releases(rg)]
+        pool = [r for rg in groups[:MAX_RELEASE_GROUPS] for r in browse_group_releases(rg)]
         ranked = rank_by_duration(pool, duration)
         how = f"closest in length of {len(pool)} editions"
     if not ranked:
@@ -649,6 +826,16 @@ def main(argv=None):
                          f"(default {SNAP_WINDOW_S:g})")
     ap.add_argument("--silence-db", type=float, default=SILENCE_DB, metavar="DB",
                     help=f"volume below which audio counts as silence (default {SILENCE_DB:g})")
+    ap.add_argument("--no-cover", action="store_true",
+                    help="do not download and embed the cover art")
+    ap.add_argument("--cover-size", choices=COVER_SIZES, default="500",
+                    help="cover size in pixels, or full (default 500)")
+    ap.add_argument("--format", type=parse_formats, default=["md"], metavar="LIST",
+                    help="overview file format(s), comma separated: md, csv, json "
+                         "(default md)")
+    ap.add_argument("--force", action="store_true",
+                    help=f"split even when file and album differ more than "
+                         f"{MAX_MISMATCH_FRAC * 100:g}%% in length")
     ap.add_argument("--dry-run", action="store_true",
                     help="show the release and cut points, write nothing")
     args = ap.parse_args(argv)
@@ -671,17 +858,23 @@ def main(argv=None):
     except (LookupError, RuntimeError, ValueError) as exc:
         sys.exit(f"error: {exc}")
 
+    discs = f" on {release.disc_count} discs" if release.disc_count > 1 else ""
     print(f"Album : {release.artist} - {release.title}"
           + (f" ({release.year})" if release.year else "")
-          + f", {len(release.tracks)} tracks")
+          + f", {len(release.tracks)} tracks{discs}"
+          + (", compilation" if release.compilation else ""))
     print(f"Input : {args.input} ({fmt(duration)}, {codec})")
 
     diff = duration_mismatch(release, duration)
     if diff is not None:
-        print(f"warning: the file is {fmt(abs(diff))} {'longer' if diff > 0 else 'shorter'} "
-              f"than the album in MusicBrainz ({fmt(release.total_length())}); "
-              "cut points may be off. Check the result or try another --release-id.",
-              file=sys.stderr)
+        total = release.total_length()
+        msg = (f"the file is {fmt(abs(diff))} {'longer' if diff > 0 else 'shorter'} "
+               f"than the album in MusicBrainz ({fmt(total)})")
+        if abs(diff) > MAX_MISMATCH_FRAC * total and not args.force:
+            sys.exit(f"error: {msg}; probably the wrong edition or album. Pick another "
+                     "with --release-id, or use --force to split anyway.")
+        print(f"warning: {msg}; cut points may be off. Check the result or try another "
+              "--release-id.", file=sys.stderr)
 
     scale, silences = 1.0, []
     if not args.no_snap:
@@ -710,13 +903,27 @@ def main(argv=None):
     outdir = args.output or default_output_dir(args.input, release)
     print(f"Output: {outdir}" + ("" if copy else f"  (re-encoding {codec} to AAC)"))
     print()
-    print(console_table(rows))
+    print(console_table(rows, columns_for(release)))
 
     if args.dry_run:
         print("\nDry run: nothing written.")
         return
 
     os.makedirs(outdir, exist_ok=True)
+    cover, cover_file = None, None
+    if not args.no_cover:
+        try:
+            cover = fetch_cover(release, args.cover_size)
+        except RuntimeError as exc:
+            print(f"warning: no cover art: {exc}", file=sys.stderr)
+        if cover:
+            cover_file = f"cover.{'png' if image_type(cover) == 'png' else 'jpg'}"
+            with open(os.path.join(outdir, cover_file), "wb") as f:
+                f.write(cover)
+            print(f"\nCover : {cover_file} ({len(cover) // 1024} KB)")
+        else:
+            print("\nCover : none in the Cover Art Archive")
+
     print()
     for i, (track, (start, end), name) in enumerate(zip(release.tracks, segments, filenames), 1):
         dst = os.path.join(outdir, name)
@@ -725,12 +932,11 @@ def main(argv=None):
             cut_track(ffmpeg, args.input, dst, start, end, copy)
         except subprocess.CalledProcessError:
             sys.exit(f"error: ffmpeg failed on track {i}")
-        tag_file(dst, release, track)
+        tag_file(dst, release, track, cover)
 
-    report = os.path.join(outdir, "tracks.md")
-    with open(report, "w", encoding="utf-8") as f:
-        f.write(markdown_report(release, rows, args.input, duration))
-    print(f"\nDone. Overview: {report}")
+    reports = write_reports(outdir, args.format, release, rows, args.input, duration,
+                            cover_file)
+    print("\nDone. Overview: " + ", ".join(reports))
 
 
 if __name__ == "__main__":

@@ -61,6 +61,44 @@ def test_parse_release_multi_disc_and_track_artist():
     assert r.genre == "" and r.date == ""
 
 
+def test_parse_release_skips_video_discs_and_renumbers():
+    data = {"id": "box", "title": "Box", "artist-credit": [{"name": "A", "artist": {"id": "a"}}],
+            "release-group": {"id": "rg"},
+            "media": [
+                {"position": 3, "format": "CD", "tracks": [{"position": 1, "title": "C1",
+                                                            "length": 1000}]},
+                {"position": 1, "format": "DVD-Video", "tracks": [{"position": 1,
+                                                                   "title": "Film",
+                                                                   "length": 9_000_000}]},
+                {"position": 2, "format": "CD", "tracks": [{"position": 1, "title": "B1",
+                                                            "length": 1000}]},
+                {"position": 4, "format": "Blu-ray", "tracks": [{"position": 1,
+                                                                 "title": "Hi-res",
+                                                                 "length": 2000}]}]}
+    r = sa.parse_release(data)
+    assert [(t.disc, t.title) for t in r.tracks] == [(1, "B1"), (2, "C1")]
+    assert r.disc_count == 2
+    assert sa.release_length(data) == 2.0
+
+
+def test_compilation_flag():
+    def release(artists, secondary=()):
+        return {"id": "c", "title": "C",
+                "artist-credit": [{"name": "Various Artists",
+                                   "artist": {"id": sa.VARIOUS_ARTISTS_ID}}]
+                if artists == "va" else [{"name": "Solo", "artist": {"id": "s"}}],
+                "release-group": {"id": "rg", "secondary-types": list(secondary)},
+                "media": [{"position": 1, "format": "CD", "tracks": [
+                    {"position": i + 1, "title": f"T{i}", "length": 1000,
+                     "artist-credit": [{"name": n, "artist": {"id": n}}]}
+                    for i, n in enumerate(["X", "Y"] if artists != "solo" else ["Solo"] * 2)]}]}
+    assert sa.parse_release(release("va")).compilation
+    assert sa.parse_release(release("mixed", ["Compilation"])).compilation
+    # a best-of by one artist is not a various-artists compilation
+    assert not sa.parse_release(release("solo", ["Compilation"])).compilation
+    assert not sa.parse_release(release("mixed")).compilation
+
+
 def test_rank_releases_prefers_official_album_then_earliest():
     cands = [
         {"id": "bootleg", "score": 100, "status": "Bootleg", "date": "1970",
@@ -250,6 +288,180 @@ def test_build_rows_delta():
 
 
 # --------------------------------------------------------------------------- #
+# Phase 3: cover art, compilations, csv/json
+# --------------------------------------------------------------------------- #
+
+def test_image_type():
+    assert sa.image_type(b"\xff\xd8\xff\xe0rest") == "jpeg"
+    assert sa.image_type(b"\x89PNG\r\n\x1a\nrest") == "png"
+    assert sa.image_type(b"<html>") is None
+
+
+def test_fetch_cover_falls_back_to_release_group(monkeypatch):
+    urls = []
+
+    def fake_get(url):
+        urls.append(url)
+        return None if "/release/" in url else b"\x89PNG\r\n\x1a\nimg"
+
+    monkeypatch.setattr(sa, "http_get_bytes", fake_get)
+    r = sa.Release("rid", "t", "a", [], "", "", "rgid", make_tracks(1))
+    assert sa.fetch_cover(r, "1200") == b"\x89PNG\r\n\x1a\nimg"
+    assert urls == ["https://coverartarchive.org/release/rid/front-1200",
+                    "https://coverartarchive.org/release-group/rgid/front-1200"]
+    urls.clear()
+    sa.fetch_cover(r, "full")
+    assert urls[0].endswith("/release/rid/front")
+
+
+def test_fetch_cover_ignores_non_images(monkeypatch):
+    monkeypatch.setattr(sa, "http_get_bytes", lambda url: b"<html>error</html>")
+    assert sa.fetch_cover(sa.Release("r", "t", "a", [], "", "", "", make_tracks(1))) is None
+
+
+def test_artist_column_only_when_artists_differ():
+    r = sa.Release("rid", "Alb", "A", [], "", "", "", make_tracks(10, 10))
+    assert ("artist", "Artist") not in sa.columns_for(r)
+    r.tracks[1].artist = "B"
+    cols = sa.columns_for(r)
+    assert cols[2] == ("artist", "Artist")
+    rows = sa.build_rows(r, [(0, 10), (10, 20)], ["a", "b"], ["metadata", "end"])
+    table = sa.console_table(rows, cols)
+    assert table.splitlines()[0].split() == ["#", "Title", "Artist", "Length", "Δ", "MB",
+                                             "Cut", "File", "Start"]
+
+
+def compilation_release():
+    tracks = [sa.Track(1, 1, "Song, One", 100.0, "X", ["x"], "rec-a", "trk-a"),
+              sa.Track(2, 1, "Two", None, "Y", ["y"], "", "")]
+    return sa.Release("rid", "Hits", "Various Artists", [sa.VARIOUS_ARTISTS_ID],
+                      "2001-02-03", "Pop", "rgid", tracks, compilation=True)
+
+
+def test_csv_report():
+    r = compilation_release()
+    rows = sa.build_rows(r, [(0, 100.25), (100.25, 160)], ["1-01 - Song, One.m4a",
+                                                           "2-01 - Two.m4a"],
+                         ["silence", "end"])
+    lines = sa.csv_report(rows).splitlines()
+    assert lines[0] == ",".join(sa.CSV_FIELDS)
+    assert lines[1] == ('1,1,"Song, One",X,1:40,100.25,0:00,0.0,100.0,0.25,silence,'
+                        '"1-01 - Song, One.m4a"')
+    assert lines[2] == "2,1,Two,Y,1:00,59.75,1:40,100.25,,,end,2-01 - Two.m4a"
+
+
+def test_json_report():
+    r = compilation_release()
+    rows = sa.build_rows(r, [(0, 100.25), (100.25, 160)], ["a.m4a", "b.m4a"],
+                         ["silence", "end"])
+    data = json.loads(sa.json_report(r, rows, "C:/x/hits.m4a", 160, "cover.png"))
+    assert data["album"] == {
+        "artist": "Various Artists", "title": "Hits", "date": "2001-02-03", "year": "2001",
+        "genre": "Pop", "compilation": True, "discs": 2, "tracks": 2,
+        "duration_seconds": 160, "source": "hits.m4a", "cover": "cover.png",
+        "musicbrainz_release_id": "rid", "musicbrainz_release_group_id": "rgid"}
+    assert data["tracks"][0] == {
+        "disc": 1, "number": 1, "title": "Song, One", "artist": "X", "length": "1:40",
+        "length_seconds": 100.25, "start": "0:00", "start_seconds": 0,
+        "end_seconds": 100.25, "musicbrainz_length_seconds": 100.0,
+        "delta_seconds": 0.25, "cut": "silence", "file": "a.m4a",
+        "musicbrainz_recording_id": "rec-a", "musicbrainz_track_id": "trk-a"}
+    assert data["tracks"][1]["musicbrainz_recording_id"] is None
+
+
+def test_markdown_report_compilation():
+    r = compilation_release()
+    rows = sa.build_rows(r, [(0, 100), (100, 160)], ["a", "b"], ["metadata", "end"])
+    md = sa.markdown_report(r, rows, "hits.m4a", 160, sa.columns_for(r), "cover.jpg")
+    assert "- Tracks: 2 on 2 discs, total 2:40" in md
+    assert "- Compilation (various artists)" in md
+    assert "| 1-1 | Song, One | X | 1:40 | 0.0s | metadata | a | 0:00 |" in md
+
+
+def test_parse_formats():
+    assert sa.parse_formats("md, CSV,json,md") == ["md", "csv", "json"]
+    with pytest.raises(Exception, match="unknown format xml"):
+        sa.parse_formats("md,xml")
+
+
+def test_tags_compilation_and_png_cover(tmp_path):
+    from mutagen.id3 import ID3
+    from mutagen.mp4 import MP4, MP4Cover
+    ffmpeg = sa.find_ffmpeg()
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
+    r = compilation_release()
+    for ext, args in ((".m4a", ["-c:a", "aac"]), (".mp3", ["-c:a", "libmp3lame"])):
+        path = str(tmp_path / f"t{ext}")
+        subprocess.run([ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi",
+                        "-i", "sine=duration=1", *args, path], check=True)
+        sa.tag_file(path, r, r.tracks[1], png)
+        if ext == ".m4a":
+            tags = MP4(path).tags
+            assert tags["cpil"] is True or tags["cpil"] == [True] or tags["cpil"]
+            assert tags["covr"][0].imageformat == MP4Cover.FORMAT_PNG
+            assert tags["disk"] == [(2, 2)] and tags["aART"] == ["Various Artists"]
+        else:
+            tags = ID3(path)
+            assert str(tags["TCMP"]) == "1"
+            assert tags.getall("APIC")[0].mime == "image/png"
+            assert str(tags["TPOS"]) == "2/2" and str(tags["TPE1"]) == "Y"
+
+
+def test_no_cover_option(tmp_path, mock_mb, monkeypatch):
+    def boom(*a):
+        raise AssertionError("cover must not be fetched")
+    monkeypatch.setattr(sa, "fetch_cover", boom)
+    src = str(tmp_path / "album.m4a")
+    make_album(src, ["-c:a", "aac"])
+    out = tmp_path / "out"
+    sa.main([src, "--release-id", "rel-1", "-o", str(out), "--no-cover"])
+    assert not (out / "cover.jpg").exists()
+    assert "![cover]" not in (out / "tracks.md").read_text(encoding="utf-8")
+
+
+def test_large_mismatch_stops_unless_forced(tmp_path, mock_mb):
+    src = str(tmp_path / "album.m4a")
+    make_album(src, ["-c:a", "aac"])                 # 12 s; rel-2 is 20 s
+    out = tmp_path / "out"
+    with pytest.raises(SystemExit, match="wrong edition or album"):
+        sa.main([src, "--release-id", "rel-2", "-o", str(out)])
+    assert not out.exists()
+    sa.main([src, "--release-id", "rel-2", "-o", str(out), "--force"])
+    assert (out / "tracks.md").is_file()
+
+
+def test_choose_release_compares_several_release_groups(monkeypatch, capsys):
+    browsed = []
+
+    def fake_get(path, params):
+        if path == "release/":
+            return {"releases": [
+                {"id": f"s{i}", "score": 100 - i, "status": "Official",
+                 "release-group": {"id": f"rg{i}", "primary-type": "Album"}}
+                for i in range(7)]}
+        browsed.append(params["release-group"])
+        n = int(params["release-group"][2:])
+        # only the 4th group holds an edition that matches the file
+        return {"release-count": 1,
+                "releases": [browse_release(f"r{n}", [600_000 if n == 3 else 100_000])]}
+
+    monkeypatch.setattr(sa, "mb_get", fake_get)
+    assert sa.choose_release("VA", "Hits", 600.0) == "r3"
+    assert browsed == [f"rg{i}" for i in range(sa.MAX_RELEASE_GROUPS)]
+
+
+def test_cover_download_error_is_a_warning(tmp_path, mock_mb, monkeypatch, capsys):
+    def fail(*a):
+        raise RuntimeError("cannot reach coverartarchive.org")
+    monkeypatch.setattr(sa, "fetch_cover", fail)
+    src = str(tmp_path / "album.m4a")
+    make_album(src, ["-c:a", "aac"])
+    sa.main([src, "--release-id", "rel-1", "-o", str(tmp_path / "out")])
+    assert "warning: no cover art" in capsys.readouterr().err
+    assert (tmp_path / "out" / "tracks.md").is_file()
+
+
+# --------------------------------------------------------------------------- #
 # End to end on a synthetic album (MusicBrainz mocked)
 #
 # Audio: tone 0-2.5, silence 2.5-3.5, tone 3.5-7.5, silence 7.5-8.5, tone 8.5-12
@@ -290,6 +502,10 @@ def mock_mb(monkeypatch):
         return editions[path.split("/")[1]]
 
     monkeypatch.setattr(sa, "mb_get", fake_get)
+    monkeypatch.setattr(sa, "fetch_cover", lambda release, size: FAKE_JPEG)
+
+
+FAKE_JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 64 + b"\xff\xd9"
 
 
 def make_album(path, codec_args):
@@ -312,11 +528,13 @@ def test_end_to_end(tmp_path, mock_mb, ext, codec_args):
     src = str(tmp_path / f"album{ext}")
     make_album(src, codec_args)
     out = tmp_path / "out"
-    sa.main([src, "--artist", "Tone Makers", "--album", "Synth: Album", "-o", str(out)])
+    sa.main([src, "--artist", "Tone Makers", "--album", "Synth: Album", "-o", str(out),
+             "--format", "md,csv,json"])
 
     files = sorted(p.name for p in out.iterdir())
     assert files == [f"01 - Tone 1{ext}", f"02 - Tone 2{ext}", f"03 - Tone 3{ext}",
-                     "tracks.md"]
+                     "cover.jpg", "tracks.csv", "tracks.json", "tracks.md"]
+    assert (out / "cover.jpg").read_bytes() == FAKE_JPEG
     # cut in the middle of the silences, not at the MusicBrainz lengths
     for name, expected in zip(files, [3.0, 5.0, 4.0]):
         assert duration_of(str(out / name)) == pytest.approx(expected, abs=0.1)
@@ -333,6 +551,8 @@ def test_end_to_end(tmp_path, mock_mb, ext, codec_args):
         # the edition matching the file length was chosen, not the top search hit
         assert bytes(tags["----:com.apple.iTunes:MusicBrainz Album Id"][0]) == b"rel-1"
         assert bytes(tags["----:com.apple.iTunes:MusicBrainz Track Id"][0]) == b"rec-1"
+        assert bytes(tags["covr"][0]) == FAKE_JPEG
+        assert "cpil" not in tags
     else:
         from mutagen.id3 import ID3
         tags = ID3(second)
@@ -342,9 +562,23 @@ def test_end_to_end(tmp_path, mock_mb, ext, codec_args):
         assert str(tags["TDRC"]) == "2019-05-05" and str(tags["TCON"]) == "Electronic"
         assert str(tags["TXXX:MusicBrainz Album Id"]) == "rel-1"
         assert tags["UFID:http://musicbrainz.org"].data == b"rec-1"
+        apic = tags.getall("APIC")[0]
+        assert apic.data == FAKE_JPEG and apic.mime == "image/jpeg" and apic.type == 3
+        assert not tags.getall("TCMP")
+
+    data = json.loads((out / "tracks.json").read_text(encoding="utf-8"))
+    assert data["album"]["musicbrainz_release_id"] == "rel-1"
+    assert data["album"]["cover"] == "cover.jpg"
+    assert [t["file"] for t in data["tracks"]] == files[:3]
+    assert data["tracks"][1]["start_seconds"] == pytest.approx(3.0, abs=0.1)
+
+    csv_text = (out / "tracks.csv").read_text(encoding="utf-8-sig")
+    assert csv_text.splitlines()[0] == ",".join(sa.CSV_FIELDS)
+    assert csv_text.splitlines()[2].startswith("1,2,Tone 2,Tone Makers,0:05,")
 
     md = (out / "tracks.md").read_text(encoding="utf-8")
     assert "# Tone Makers - Synth: Album" in md
+    assert "![cover](cover.jpg)" in md
     assert f"| 1 | Tone 1 | 0:03 | -0.4s | silence | 01 - Tone 1{ext} | 0:00 |" in md
     assert f"| 2 | Tone 2 | 0:05 | +0.4s | silence | 02 - Tone 2{ext} | 0:03 |" in md
     assert f"| 3 | Tone 3 | 0:04 | 0.0s | end | 03 - Tone 3{ext} | 0:08 |" in md
