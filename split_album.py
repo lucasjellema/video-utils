@@ -4,22 +4,32 @@ split_album.py - split one audio file holding a whole album (.m4a / .mp3) into
 one file per track, with the right metadata on each file.
 
 Usage:
-    python split_album.py INPUT --artist ARTIST --album ALBUM [--release-id MBID] [-o DIR] [--dry-run]
+    python split_album.py INPUT --artist ARTIST --album ALBUM [--release-id MBID] [-o DIR]
+                          [--no-snap] [--snap-window S] [--silence-db DB] [--dry-run]
 
 python split_album.py "C:\Music\Pink Floyd - Wish You Were Here.m4a" --artist "Pink Floyd" --album "Wish You Were Here"
 
 How it works:
-    1. The album is looked up in MusicBrainz (free, no API key). When several
-       releases match, the best-scoring official album release is used; the
-       alternatives are printed so you can force one with --release-id.
-    2. The file is cut at the cumulative track lengths from MusicBrainz. The
-       last track runs to the end of the file.
+    1. The album is looked up in MusicBrainz (free, no API key). Of all
+       editions (releases) of the album, the one whose total length is closest
+       to the duration of the file is used; ties go to the official, earliest
+       edition. The runners-up are printed so you can force one with
+       --release-id.
+    2. Cut points: when the file and the edition differ in length by at most
+       3%, the track lengths are scaled to fit. Each cut point is then moved to
+       the middle of the nearest silence within --snap-window seconds (default
+       5). Where no silence is found (gapless or live albums) the point from
+       the metadata is kept. Each cut is placed relative to the previous one,
+       so a gap between tracks does not shift all later cuts. The last track
+       runs to the end of the file. --no-snap cuts purely at the track lengths
+       from MusicBrainz (no scaling, no silence detection).
     3. Cutting uses stream copy (no re-encoding, no quality loss) for AAC and
        MP3 input. Other codecs are re-encoded to AAC (.m4a, 256 kbit/s).
     4. Each track gets tags: title, artist, album artist, album, track and disc
        number, year, genre and the MusicBrainz IDs.
-    5. tracks.md (overview: number, title, length, file name, start) is written
-       next to the tracks and printed to the console.
+    5. tracks.md (overview: number, title, length, difference with the length
+       in MusicBrainz, how the end of the track was found, file name, start) is
+       written next to the tracks and printed to the console.
 
 Output: <input folder>/<Artist>/<Year> - <Album>/NN - Title.ext
         (D-NN - Title.ext for multi-disc albums). Use -o to choose the folder.
@@ -52,6 +62,18 @@ USER_AGENT = "split_album/0.1 ( https://github.com/lucasjellema/video-utils )"
 # than this (seconds, or fraction of the album length - whichever is larger).
 DURATION_TOLERANCE_S = 5.0
 DURATION_TOLERANCE_FRAC = 0.01
+
+# Scale the track lengths to the file when they differ at most this fraction.
+SCALE_MAX_FRAC = 0.03
+# Silence detection: search this far (seconds) around each expected cut point,
+# for stretches quieter than SILENCE_DB lasting at least SILENCE_MIN_S.
+SNAP_WINDOW_S = 5.0
+SILENCE_DB = -40.0
+SILENCE_MIN_S = 0.3
+# A snapped cut never makes a track shorter than this (seconds).
+MIN_TRACK_S = 1.0
+# Max pages (each up to 100 releases) fetched when comparing editions.
+MAX_BROWSE_PAGES = 5
 
 
 # --------------------------------------------------------------------------- #
@@ -152,13 +174,67 @@ def rank_releases(candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=key)
 
 
-def describe_candidate(r: dict) -> str:
+def _track_count(r: dict):
+    if "track-count" in r:
+        return r["track-count"]
+    media = r.get("media", [])
+    return sum(m.get("track-count", len(m.get("tracks", []))) for m in media) if media else "?"
+
+
+def describe_candidate(r: dict, duration: float | None = None) -> str:
     parts = [r.get("date") or "????", r.get("country") or "",
              "+".join(m.get("format") or "?" for m in r.get("media", [])),
-             f"{r.get('track-count', '?')} tracks"]
+             f"{_track_count(r)} tracks"]
     if r.get("disambiguation"):
         parts.append(r["disambiguation"])
+    length = release_length(r)
+    if length is not None:
+        parts.append(f"length {fmt(length)}")
+        if duration is not None:
+            parts.append(f"file {fmt_delta(duration - length)}")
     return f"{r['id']}  " + ", ".join(p for p in parts if p)
+
+
+def browse_group_releases(release_group_id: str) -> list[dict]:
+    """All releases of a release group, with their tracks (paged)."""
+    releases, offset = [], 0
+    for _ in range(MAX_BROWSE_PAGES):
+        page = mb_get("release", {"release-group": release_group_id,
+                                  "inc": "recordings", "limit": 100, "offset": offset})
+        batch = page.get("releases", [])
+        releases += batch
+        offset += len(batch)
+        if not batch or offset >= page.get("release-count", 0):
+            break
+    return releases
+
+
+def release_length(r: dict) -> float | None:
+    """Total length (seconds) of a release from a browse result, if every track has one."""
+    lengths = [t.get("length") for m in r.get("media", []) for t in m.get("tracks", [])]
+    if not lengths or any(not l for l in lengths):
+        return None
+    return sum(lengths) / 1000
+
+
+def rank_by_duration(releases: list[dict], duration: float) -> list[dict]:
+    """Releases with a known length, best match with the file duration first.
+
+    Differences are compared in whole seconds; ties go to the most common
+    track count (filters odd editions), then official, then earliest.
+    """
+    known = [(r, release_length(r)) for r in releases]
+    known = [(r, l) for r, l in known if l is not None]
+    if not known:
+        return []
+    counts = [_track_count(r) for r, _ in known]
+    common = max(set(counts), key=counts.count)
+
+    def key(item):
+        r, length = item
+        return (round(abs(duration - length)), _track_count(r) != common,
+                r.get("status") != "Official", r.get("date") or "9999")
+    return [r for r, _ in sorted(known, key=key)]
 
 
 def fetch_release(release_id: str) -> dict:
@@ -207,24 +283,102 @@ def parse_release(data: dict) -> Release:
 # Cut points
 # --------------------------------------------------------------------------- #
 
-def compute_segments(tracks: list[Track], duration: float) -> list[tuple[float, float]]:
-    """(start, end) per track from the cumulative lengths; last track runs to the end."""
-    segments, pos = [], 0.0
+def fmt_delta(seconds: float) -> str:
+    """Signed difference: '+0:03', '-1:10', '0:00'."""
+    sign = "+" if seconds >= 0.5 else "-" if seconds <= -0.5 else ""
+    return sign + fmt(abs(seconds))
+
+
+def scale_factor(release: Release, duration: float) -> float:
+    """duration / album length when they differ at most SCALE_MAX_FRAC, else 1."""
+    total = release.total_length()
+    if not total or abs(duration - total) > SCALE_MAX_FRAC * total:
+        return 1.0
+    return duration / total
+
+
+def parse_silences(ffmpeg_log: str, duration: float) -> list[tuple[float, float]]:
+    """(start, end) of each silence reported by ffmpeg's silencedetect filter."""
+    silences, start = [], None
+    for line in ffmpeg_log.splitlines():
+        m = re.search(r"silence_start:\s*(-?[\d.]+)", line)
+        if m:
+            start = max(0.0, float(m.group(1)))
+            continue
+        m = re.search(r"silence_end:\s*([\d.]+)", line)
+        if m and start is not None:
+            silences.append((start, float(m.group(1))))
+            start = None
+    if start is not None:                       # silent until the end of the file
+        silences.append((start, duration))
+    return silences
+
+
+def detect_silences(ffmpeg: str, path: str, duration: float,
+                    noise_db: float = SILENCE_DB) -> list[tuple[float, float]]:
+    result = subprocess.run(
+        [ffmpeg, "-hide_banner", "-nostats", "-i", path, "-map", "0:a:0", "-vn",
+         "-af", f"silencedetect=noise={noise_db}dB:d={SILENCE_MIN_S}", "-f", "null", "-"],
+        capture_output=True, text=True, errors="replace")
+    if result.returncode != 0:
+        raise RuntimeError(f"silence detection failed:\n{result.stderr[-2000:]}")
+    return parse_silences(result.stderr, duration)
+
+
+def snap_point(expected: float, silences, window: float, lo: float, hi: float):
+    """Middle of the silence nearest to `expected` (within `window`), kept inside (lo, hi).
+
+    Returns the point, or None when no usable silence is near.
+    """
+    best = None
+    for s, e in silences:
+        a, b = max(s, expected - window), min(e, expected + window)
+        if a > b:
+            continue                            # silence outside the window
+        point = (a + b) / 2
+        if not lo < point < hi:
+            continue
+        dist = 0.0 if s <= expected <= e else min(abs(s - expected), abs(e - expected))
+        if best is None or dist < best[0]:
+            best = (dist, point)
+    return None if best is None else best[1]
+
+
+def plan_cuts(tracks: list[Track], duration: float, silences=(),
+              window: float = SNAP_WINDOW_S, scale: float = 1.0):
+    """Cut the file into tracks.
+
+    Returns (segments, methods): (start, end) per track, and per track how its
+    end was found: 'silence', 'scaled', 'metadata' or 'end' (last track).
+    Each expected end is the previous cut plus the (scaled) track length.
+    """
+    segments, methods, pos = [], [], 0.0
     for i, t in enumerate(tracks):
-        last = i == len(tracks) - 1
         if pos >= duration:
             raise ValueError(f"the file ({fmt(duration)}) ends before track {i + 1} "
                              f"'{t.title}' starts ({fmt(pos)}); wrong album or release?")
-        if last:
-            end = duration
+        if i == len(tracks) - 1:
+            end, method = duration, "end"
         elif t.length is None:
             raise ValueError(f"MusicBrainz has no length for track {i + 1} '{t.title}'; "
                              "try another release with --release-id")
         else:
-            end = min(pos + t.length, duration)
+            expected = min(pos + t.length * scale, duration)
+            snapped = snap_point(expected, silences, window,
+                                 pos + MIN_TRACK_S, duration - MIN_TRACK_S)
+            if snapped is not None:
+                end, method = snapped, "silence"
+            else:
+                end, method = expected, "scaled" if scale != 1.0 else "metadata"
         segments.append((pos, end))
+        methods.append(method)
         pos = end
-    return segments
+    return segments, methods
+
+
+def compute_segments(tracks: list[Track], duration: float) -> list[tuple[float, float]]:
+    """(start, end) per track from the plain cumulative lengths (no snapping)."""
+    return plan_cuts(tracks, duration)[0]
 
 
 def duration_mismatch(release: Release, duration: float) -> float | None:
@@ -385,15 +539,25 @@ def track_label(track: Track, multi_disc: bool) -> str:
     return f"{track.disc}-{track.number}" if multi_disc else str(track.number)
 
 
-def build_rows(release: Release, segments, filenames) -> list[dict]:
+def build_rows(release: Release, segments, filenames, methods=None) -> list[dict]:
     multi = release.disc_count > 1
-    return [{"nr": track_label(t, multi), "title": t.title, "length": fmt(e - s),
-             "file": f, "start": fmt(s)}
-            for t, (s, e), f in zip(release.tracks, segments, filenames)]
+    methods = methods or ["metadata"] * len(segments)
+    rows = []
+    for t, (s, e), f, m in zip(release.tracks, segments, filenames, methods):
+        if t.length is None:
+            delta = ""
+        else:
+            d = round((e - s) - t.length, 1)
+            delta = "0.0s" if d == 0 else f"{d:+.1f}s"
+        rows.append({"nr": track_label(t, multi), "title": t.title, "length": fmt(e - s),
+                     "delta": delta, "cut": m, "file": f, "start": fmt(s)})
+    return rows
 
 
-COLUMNS = [("nr", "#"), ("title", "Title"), ("length", "Length"), ("file", "File"),
-           ("start", "Start")]
+# delta: length in the file minus the length in MusicBrainz
+# cut:   how the end of the track was found
+COLUMNS = [("nr", "#"), ("title", "Title"), ("length", "Length"), ("delta", "Δ MB"),
+           ("cut", "Cut"), ("file", "File"), ("start", "Start")]
 
 
 def console_table(rows: list[dict]) -> str:
@@ -415,6 +579,11 @@ def markdown_report(release: Release, rows: list[dict], source: str, duration: f
               f"- Source: `{os.path.basename(source)}`",
               f"- MusicBrainz release: https://musicbrainz.org/release/{release.id}",
               "",
+              "Δ MB: length in the file minus the length in MusicBrainz. "
+              "Cut: how the end of the track was found (silence = moved to the nearest "
+              "silence, scaled = track lengths scaled to the file, metadata = track "
+              "length from MusicBrainz, end = end of the file).",
+              "",
               "| " + " | ".join(h for _, h in COLUMNS) + " |",
               "|" + "|".join("---" for _ in COLUMNS) + "|"]
     lines += ["| " + " | ".join(esc(r[k]) for k, _ in COLUMNS) + " |" for r in rows]
@@ -425,17 +594,39 @@ def markdown_report(release: Release, rows: list[dict], source: str, duration: f
 # Main
 # --------------------------------------------------------------------------- #
 
-def lookup_release(artist: str | None, album: str | None, release_id: str | None) -> Release:
+def choose_release(artist: str, album: str, duration: float | None) -> str:
+    """Release ID of the edition that best fits the file; prints the choice."""
+    candidates = rank_releases(search_releases(artist, album))
+    if not candidates:
+        raise LookupError(f"no release found in MusicBrainz for '{artist}' - '{album}'")
+
+    ranked, how = [], "best search match"
+    if duration is not None:
+        # all editions of the best-matching release group(s)
+        top = candidates[0].get("score")
+        groups = []
+        for c in candidates:
+            rg = c.get("release-group", {}).get("id")
+            if c.get("score") == top and rg and rg not in groups:
+                groups.append(rg)
+        pool = [r for rg in groups[:3] for r in browse_group_releases(rg)]
+        ranked = rank_by_duration(pool, duration)
+        how = f"closest in length of {len(pool)} editions"
+    if not ranked:
+        ranked = candidates
+
+    print(f"Release ({how}): {describe_candidate(ranked[0], duration)}")
+    if len(ranked) > 1:
+        print("  runners-up (use --release-id to pick one):")
+        for c in ranked[1:4]:
+            print(f"    {describe_candidate(c, duration)}")
+    return ranked[0]["id"]
+
+
+def lookup_release(artist: str | None, album: str | None, release_id: str | None,
+                   duration: float | None = None) -> Release:
     if not release_id:
-        candidates = rank_releases(search_releases(artist, album))
-        if not candidates:
-            raise LookupError(f"no release found in MusicBrainz for '{artist}' - '{album}'")
-        release_id = candidates[0]["id"]
-        print(f"Release: {describe_candidate(candidates[0])}")
-        if len(candidates) > 1:
-            print("  other matches (use --release-id to pick one):")
-            for c in candidates[1:4]:
-                print(f"    {describe_candidate(c)}")
+        release_id = choose_release(artist, album, duration)
     return parse_release(fetch_release(release_id))
 
 
@@ -450,6 +641,14 @@ def main(argv=None):
     ap.add_argument("--release-id", help="MusicBrainz release ID (skips the search)")
     ap.add_argument("-o", "--output", help="output folder "
                     "(default: <input folder>/<Artist>/<Year> - <Album>)")
+    ap.add_argument("--no-snap", action="store_true",
+                    help="cut purely at the MusicBrainz track lengths "
+                         "(no scaling, no silence detection)")
+    ap.add_argument("--snap-window", type=float, default=SNAP_WINDOW_S, metavar="S",
+                    help=f"search for silence this many seconds around each cut "
+                         f"(default {SNAP_WINDOW_S:g})")
+    ap.add_argument("--silence-db", type=float, default=SILENCE_DB, metavar="DB",
+                    help=f"volume below which audio counts as silence (default {SILENCE_DB:g})")
     ap.add_argument("--dry-run", action="store_true",
                     help="show the release and cut points, write nothing")
     args = ap.parse_args(argv)
@@ -468,7 +667,7 @@ def main(argv=None):
     ext, copy = output_format(codec)
 
     try:
-        release = lookup_release(args.artist, args.album, args.release_id)
+        release = lookup_release(args.artist, args.album, args.release_id, duration)
     except (LookupError, RuntimeError, ValueError) as exc:
         sys.exit(f"error: {exc}")
 
@@ -484,14 +683,30 @@ def main(argv=None):
               "cut points may be off. Check the result or try another --release-id.",
               file=sys.stderr)
 
+    scale, silences = 1.0, []
+    if not args.no_snap:
+        scale = scale_factor(release, duration)
+        if scale != 1.0:
+            print(f"Scale : track lengths x {scale:.4f} to fit the file")
+        print("Detecting silences...", flush=True)
+        try:
+            silences = detect_silences(ffmpeg, args.input, duration, args.silence_db)
+        except RuntimeError as exc:
+            sys.exit(f"error: {exc}")
+
     try:
-        segments = compute_segments(release.tracks, duration)
+        segments, methods = plan_cuts(release.tracks, duration, silences,
+                                      args.snap_window, scale)
     except ValueError as exc:
         sys.exit(f"error: {exc}")
+    if not args.no_snap and len(methods) > 1:
+        snapped = methods.count("silence")
+        print(f"Cuts  : {snapped} of {len(methods) - 1} moved to a silence "
+              f"({len(silences)} silences found)")
 
     multi = release.disc_count > 1
     filenames = [track_filename(t, multi, ext) for t in release.tracks]
-    rows = build_rows(release, segments, filenames)
+    rows = build_rows(release, segments, filenames, methods)
     outdir = args.output or default_output_dir(args.input, release)
     print(f"Output: {outdir}" + ("" if copy else f"  (re-encoding {codec} to AAC)"))
     print()
