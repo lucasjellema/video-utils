@@ -327,7 +327,7 @@ def test_artist_column_only_when_artists_differ():
     assert cols[2] == ("artist", "Artist")
     rows = sa.build_rows(r, [(0, 10), (10, 20)], ["a", "b"], ["metadata", "end"])
     table = sa.console_table(rows, cols)
-    assert table.splitlines()[0].split() == ["#", "Title", "Artist", "Length", "Δ", "MB",
+    assert table.splitlines()[0].split() == ["#", "Title", "Artist", "Length", "Δ",
                                              "Cut", "File", "Start"]
 
 
@@ -346,8 +346,8 @@ def test_csv_report():
     lines = sa.csv_report(rows).splitlines()
     assert lines[0] == ",".join(sa.CSV_FIELDS)
     assert lines[1] == ('1,1,"Song, One",X,1:40,100.25,0:00,0.0,100.0,0.25,silence,'
-                        '"1-01 - Song, One.m4a"')
-    assert lines[2] == "2,1,Two,Y,1:00,59.75,1:40,100.25,,,end,2-01 - Two.m4a"
+                        '"1-01 - Song, One.m4a",1')
+    assert lines[2] == "2,1,Two,Y,1:00,59.75,1:40,100.25,,,end,2-01 - Two.m4a,2"
 
 
 def test_json_report():
@@ -358,13 +358,13 @@ def test_json_report():
     assert data["album"] == {
         "artist": "Various Artists", "title": "Hits", "date": "2001-02-03", "year": "2001",
         "genre": "Pop", "compilation": True, "discs": 2, "tracks": 2,
-        "duration_seconds": 160, "source": "hits.m4a", "cover": "cover.png",
+        "duration_seconds": 160, "source": "hits.m4a", "cover": "cover.png", "metadata_source": "MusicBrainz",
         "musicbrainz_release_id": "rid", "musicbrainz_release_group_id": "rgid"}
     assert data["tracks"][0] == {
         "disc": 1, "number": 1, "title": "Song, One", "artist": "X", "length": "1:40",
         "length_seconds": 100.25, "start": "0:00", "start_seconds": 0,
-        "end_seconds": 100.25, "musicbrainz_length_seconds": 100.0,
-        "delta_seconds": 0.25, "cut": "silence", "file": "a.m4a",
+        "end_seconds": 100.25, "metadata_length_seconds": 100.0,
+        "delta_seconds": 0.25, "cut": "silence", "file": "a.m4a", "file_position": 1,
         "musicbrainz_recording_id": "rec-a", "musicbrainz_track_id": "trk-a"}
     assert data["tracks"][1]["musicbrainz_recording_id"] is None
 
@@ -610,3 +610,412 @@ def test_default_output_dir(tmp_path, mock_mb):
     sa.main([src, "--release-id", "rel-1"])
     assert (tmp_path / "Tone Makers" / "2019 - Synth_ Album" / "tracks.md").is_file()
 
+
+
+# --------------------------------------------------------------------------- #
+# Phase 4: album from tags / file name, tracklists, track order, AcoustID
+# --------------------------------------------------------------------------- #
+
+def test_probe_tags(tmp_path):
+    path = str(tmp_path / "t.m4a")
+    subprocess.run([sa.find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-f",
+                    "lavfi", "-i", "sine=duration=1", "-metadata", "album_artist=Pink Floyd",
+                    "-metadata", "album=Wish You Were Here", "-metadata", "title=Song: X",
+                    path], check=True)
+    tags = sa.probe_tags(sa.find_ffmpeg(), path)
+    assert tags["album_artist"] == "Pink Floyd"
+    assert tags["album"] == "Wish You Were Here"
+    assert tags["title"] == "Song: X"
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("Pink Floyd - Wish You Were Here", ("Pink Floyd", "Wish You Were Here")),
+    ("Pink Floyd - Wish You Were Here (1975) [Full Album]",
+     ("Pink Floyd", "Wish You Were Here")),
+    ("Pink_Floyd_-_Wish_You_Were_Here_(Official_Audio)", ("Pink Floyd", "Wish You Were Here")),
+    ("Pink Floyd – 1975 – Wish You Were Here", ("Pink Floyd", "Wish You Were Here")),
+    ("AC-DC - Back in Black (Remastered)", ("AC-DC", "Back in Black")),
+    ("Wish You Were Here", (None, None)),
+])
+def test_split_artist_album(text, expected):
+    assert sa.split_artist_album(text) == expected
+
+
+def test_guess_artist_album_precedence():
+    tags = {"artist": "A", "album": "B", "title": "X - Y"}
+    assert sa.guess_artist_album(tags, "C - D.m4a") == ("A", "B", "tags")
+    assert sa.guess_artist_album({"title": "X - Y [Full Album]"}, "C - D.m4a") == (
+        "X", "Y", "title tag")
+    assert sa.guess_artist_album({}, "dir/C - D.m4a") == ("C", "D", "file name")
+    assert sa.guess_artist_album({}, "album.m4a") == (None, None, "")
+
+
+@pytest.mark.parametrize("text, seconds", [
+    ("3:45", 225), ("1:02:03", 3723), ("225", 225), (225, 225), ("3:45.5", 225.5)])
+def test_parse_time(text, seconds):
+    assert sa.parse_time(text) == seconds
+
+
+@pytest.mark.parametrize("bad", ["3:75", "abc", "1:2:3:4", "-1"])
+def test_parse_time_rejects(bad):
+    with pytest.raises(ValueError):
+        sa.parse_time(bad)
+
+
+CUE = '''REM GENRE "Progressive Rock"
+REM DATE 1975
+PERFORMER "Pink Floyd"
+TITLE "Wish You Were Here"
+FILE "album.wav" WAVE
+  TRACK 01 AUDIO
+    TITLE "Shine On"
+    INDEX 01 00:00:00
+  TRACK 02 AUDIO
+    TITLE "Welcome to the Machine"
+    PERFORMER "Pink Floyd"
+    INDEX 00 13:29:00
+    INDEX 01 13:31:37
+'''
+
+
+def test_parse_cue():
+    tl = sa.parse_cue(CUE)
+    assert (tl.artist, tl.album, tl.date, tl.genre) == (
+        "Pink Floyd", "Wish You Were Here", "1975", "Progressive Rock")
+    assert tl.exact and tl.has_starts
+    assert [t["title"] for t in tl.tracks] == ["Shine On", "Welcome to the Machine"]
+    assert tl.tracks[1]["start"] == pytest.approx(13 * 60 + 31 + 37 / 75)
+
+
+def test_parse_cue_rejects_multiple_files():
+    with pytest.raises(ValueError, match="more than one FILE"):
+        sa.parse_cue(CUE + 'FILE "b.wav" WAVE\n  TRACK 03 AUDIO\n    INDEX 01 00:00:00\n')
+
+
+def test_parse_txt_start_times():
+    tl = sa.parse_txt("Artist: Pink Floyd\n"
+                      "Album: Wish You Were Here\n"
+                      "Year: 1975\n"
+                      "# comment\n"
+                      "0:00 Shine On You Crazy Diamond (Parts I-V)\n"
+                      "13:31 - Welcome to the Machine\n"
+                      "2. 20:58 Have a Cigar\n"
+                      "[26:06] Wish You Were Here\n")
+    assert (tl.artist, tl.album, tl.date) == ("Pink Floyd", "Wish You Were Here", "1975")
+    assert [(t["title"], t["start"]) for t in tl.tracks] == [
+        ("Shine On You Crazy Diamond (Parts I-V)", 0), ("Welcome to the Machine", 811),
+        ("Have a Cigar", 1258), ("Wish You Were Here", 1566)]
+    assert tl.has_starts and not tl.exact
+
+
+def test_parse_txt_lengths():
+    tl = sa.parse_txt("01. Speak to Me 1:30\n02 - Breathe (In the Air) - 2:43\n"
+                      "Time (6:53)\n99 Luftballons 3:52\n")
+    assert [(t["title"], t["length"]) for t in tl.tracks] == [
+        ("Speak to Me", 90), ("Breathe (In the Air)", 163), ("Time", 413),
+        ("99 Luftballons", 232)]
+
+
+def test_parse_txt_errors():
+    with pytest.raises(ValueError, match="mixes"):
+        sa.parse_txt("0:00 A\nB 3:00\n")
+    with pytest.raises(ValueError, match="cannot read"):
+        sa.parse_txt("just a title\n")
+
+
+def test_parse_json_tracklist():
+    tl = sa.parse_json_tracklist(json.dumps({
+        "artist": "VA", "album": "Hits", "year": 2001, "tracks": [
+            {"title": "A", "length": "3:00", "artist": "X"},
+            {"title": "B", "length": 200, "disc": 2},
+            {"title": "C"}]}))
+    assert tl.date == "2001" and not tl.has_starts
+    assert tl.tracks[0] == {"title": "A", "artist": "X", "disc": 1, "length": 180}
+    assert tl.tracks[1]["disc"] == 2 and "length" not in tl.tracks[2]
+    with pytest.raises(ValueError, match="track 1 has no length"):
+        sa.parse_json_tracklist('{"tracks": [{"title": "A"}, {"title": "B"}]}')
+    with pytest.raises(ValueError, match="start time for every track"):
+        sa.parse_json_tracklist('{"tracks": [{"start": 0}, {"length": 3}]}')
+
+
+def test_release_from_tracklist():
+    tl = sa.parse_txt("0:00 A\n1:00 B\n2:30 C\n")
+    with pytest.raises(ValueError, match="no artist/album"):
+        sa.release_from_tracklist(tl, None, None)
+    r = sa.release_from_tracklist(tl, "Art", "Alb")
+    assert [t.length for t in r.tracks] == [60, 90, None]
+    assert r.starts == [0, 60, 150] and not r.exact_starts
+    assert r.id == "" and r.source == "tracklist" and not r.compilation
+    assert [t.artist for t in r.tracks] == ["Art"] * 3
+
+    tl = sa.parse_json_tracklist(json.dumps({"artist": "VA", "album": "Hits", "tracks": [
+        {"title": "A", "length": 1, "artist": "X"}, {"title": "B", "length": 1, "disc": 2},
+        {"title": "C", "length": 1, "disc": 2}]}))
+    r = sa.release_from_tracklist(tl, None, None)
+    assert [(t.disc, t.number) for t in r.tracks] == [(1, 1), (2, 1), (2, 2)]
+    assert r.compilation and r.starts is None
+    with pytest.raises(ValueError, match="must increase"):
+        sa.release_from_tracklist(sa.parse_txt("0:00 A\n0:00 B\n"), "a", "b")
+
+
+def test_parse_order():
+    tracks = make_tracks(1, 2, 3)
+    assert sa.parse_order("3, 1,2", tracks) == [2, 0, 1]
+    with pytest.raises(ValueError, match="exactly once"):
+        sa.parse_order("1,1,2", tracks)
+    with pytest.raises(ValueError, match="unknown track '4'"):
+        sa.parse_order("1,2,4", tracks)
+    multi = make_tracks(1, 2, 3)
+    multi[2].disc, multi[2].number = 2, 1
+    assert sa.parse_order("2-1,1-1,1-2", multi) == [2, 0, 1]
+    assert sa.parse_order("3,1,2", multi) == [2, 0, 1]
+
+
+def shuffled(lengths, file_order, gap=1.0):
+    """Silences (gap long) between the tracks as they sit in the file."""
+    silences, pos = [], 0.0
+    for i in file_order[:-1]:
+        pos += lengths[i]
+        silences.append((pos - gap / 2, pos + gap / 2))
+    return silences, pos + lengths[file_order[-1]]
+
+
+def test_detect_order_from_lengths():
+    lengths = [200.0, 150.0, 320.0, 245.0, 180.0]
+    tracks = make_tracks(*lengths)
+    silences, duration = shuffled(lengths, [2, 0, 4, 1, 3])
+    silences += [(50, 51), (400, 400.8)]               # quiet bits inside tracks
+    found = sa.detect_order(tracks, duration, silences)
+    assert found.order == [2, 0, 4, 1, 3] and found.ambiguous == []
+    assert [round(s) for s, _ in found.segments] == [0, 320, 520, 700, 850]
+
+
+def test_detect_order_flags_lookalikes():
+    lengths = [200.0, 200.5, 300.0]
+    silences, duration = shuffled(lengths, [2, 1, 0])
+    found = sa.detect_order(make_tracks(*lengths), duration, silences)
+    assert found.order == [2, 1, 0]                    # closest length match
+    assert found.ambiguous == [(0, 1)]                 # ... but 0 and 1 are flagged
+
+
+def test_assign_segments_lookalikes_beyond_margin_are_not_flagged():
+    # 3 s apart: swapping costs 6 s more, clearly distinguishable
+    order, ambiguous = sa.assign_segments([203.0, 200.0], [200.0, 203.0])
+    assert order == [1, 0] and ambiguous == []
+
+
+def test_detect_order_with_identifier():
+    lengths = [200.0, 200.5, 300.0]
+    tracks = make_tracks(*lengths)
+    for i, t in enumerate(tracks):
+        t.recording_id = f"rec{i}"
+    silences, duration = shuffled(lengths, [2, 1, 0])
+    truth = {0.0: "rec2", 300.0: "rec1", 500.5: "rec0"}    # segment start -> recording
+    identify = lambda s, e: truth[min(truth, key=lambda b: abs(b - s))]
+    found = sa.detect_order(tracks, duration, silences, identify=identify)
+    assert found.order == [2, 1, 0] and found.identified == 3
+
+
+def test_detect_order_gives_up():
+    lengths = [200.0, 150.0, 320.0]
+    assert sa.detect_order(make_tracks(*lengths), 670, []) is None    # no silences
+    silences, duration = shuffled([100.0, 400.0, 170.0], [0, 1, 2])   # other album
+    assert sa.detect_order(make_tracks(*lengths), duration, silences) is None
+    t = make_tracks(*lengths)
+    t[0].length = None
+    assert sa.detect_order(t, 670, [(199, 201)]) is None
+
+
+class FakeResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload).encode()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_acoustid_lookup(monkeypatch):
+    import urllib.parse
+    sent = {}
+
+    def fake_urlopen(req, timeout):
+        sent.update(urllib.parse.parse_qs(req.data.decode()))
+        return FakeResponse({"status": "ok", "results": [
+            {"score": 0.6, "recordings": [{"id": "low"}]},
+            {"score": 0.95, "recordings": [{"id": "high"}]}]})
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", fake_urlopen)
+    assert sa.acoustid_lookup("KEY", "FP", 245.6) == [(0.95, "high"), (0.6, "low")]
+    assert sent["client"] == ["KEY"] and sent["duration"] == ["246"]
+    assert sent["meta"] == ["recordingids"] and sent["fingerprint"] == ["FP"]
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", lambda req, timeout: FakeResponse(
+        {"status": "error", "error": {"message": "invalid API key"}}))
+    with pytest.raises(RuntimeError, match="invalid API key"):
+        sa.acoustid_lookup("BAD", "FP", 10)
+
+
+def test_acoustid_identifier(monkeypatch):
+    tracks = make_tracks(10, 10)
+    tracks[0].recording_id, tracks[1].recording_id = "rec-a", "rec-b"
+    monkeypatch.setattr(sa, "fingerprint", lambda ff, path, s, e: f"fp{s:g}")
+    answers = {"fp0": [(0.9, "other"), (0.8, "rec-b")],     # first hit not on the album
+               "fp10": [(0.3, "rec-a")]}                     # too unsure
+    monkeypatch.setattr(sa, "acoustid_lookup", lambda key, fp, d: answers[fp])
+    identify = sa.acoustid_identifier("ffmpeg", "x.m4a", "KEY", tracks)
+    assert identify(0, 10) == "rec-b"
+    assert identify(10, 20) is None
+
+
+def test_fingerprint(tmp_path):
+    path = str(tmp_path / "t.m4a")
+    subprocess.run([sa.find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-f",
+                    "lavfi", "-i", "sine=frequency=500:duration=20", path], check=True)
+    fp = sa.fingerprint(sa.find_ffmpeg(), path, 0, 20)
+    assert fp and all(c.isalnum() or c in "-_" for c in fp)
+
+
+# ---- end to end: tracks in another order ----------------------------------
+
+ORDER_LENGTHS = [30.0, 45.0, 60.0]
+
+
+@pytest.fixture
+def mock_mb_order(monkeypatch):
+    rel = synth_release("rel-o", ORDER_LENGTHS)
+    monkeypatch.setattr(sa, "mb_get", lambda path, params: rel)
+    monkeypatch.setattr(sa, "fetch_cover", lambda release, size: None)
+
+
+def make_shuffled_album(path, file_order):
+    """Tones with a 1 s silence between tracks, laid out in `file_order`."""
+    silences, total = shuffled(ORDER_LENGTHS, file_order)
+    gate = "+".join(f"between(t,{s:.3f},{e:.3f})" for s, e in silences)
+    expr = f"sin(2*PI*440*t)*0.5*(1-({gate}))"
+    subprocess.run([sa.find_ffmpeg(), "-hide_banner", "-loglevel", "error", "-y", "-f",
+                    "lavfi", "-i", f"aevalsrc='{expr}':s=22050:d={total}", "-c:a", "aac",
+                    path], check=True)
+
+
+def test_end_to_end_detects_other_order(tmp_path, mock_mb_order, capsys):
+    src = str(tmp_path / "album.m4a")
+    make_shuffled_album(src, [2, 0, 1])                # file: track 3, 1, 2
+    out = tmp_path / "out"
+    sa.main([src, "--release-id", "rel-o", "-o", str(out), "--format", "md,json"])
+    printed = capsys.readouterr().out
+    assert "the file holds the tracks in this order: 3, 1, 2" in printed
+    for name, expected in [("01 - Tone 1.m4a", 30), ("02 - Tone 2.m4a", 45),
+                           ("03 - Tone 3.m4a", 60)]:
+        assert duration_of(str(out / name)) == pytest.approx(expected, abs=0.6)
+    data = json.loads((out / "tracks.json").read_text(encoding="utf-8"))
+    assert [t["file_position"] for t in data["tracks"]] == [2, 3, 1]
+    assert data["tracks"][0]["start_seconds"] == pytest.approx(60, abs=0.6)
+    md = (out / "tracks.md").read_text(encoding="utf-8")
+    assert "In file |" in md and "another order" in md
+
+
+def test_explicit_order_matches_detection(tmp_path, mock_mb_order):
+    src = str(tmp_path / "album.m4a")
+    make_shuffled_album(src, [2, 0, 1])
+    out = tmp_path / "out"
+    sa.main([src, "--release-id", "rel-o", "-o", str(out), "--order", "3,1,2",
+             "--format", "json"])
+    data = json.loads((out / "tracks.json").read_text(encoding="utf-8"))
+    assert [t["file_position"] for t in data["tracks"]] == [2, 3, 1]
+    assert [t["cut"] for t in data["tracks"]] == ["silence", "end", "silence"]
+
+
+def test_order_album_disables_detection(tmp_path, mock_mb_order, capsys):
+    src = str(tmp_path / "album.m4a")
+    make_shuffled_album(src, [2, 0, 1])
+    sa.main([src, "--release-id", "rel-o", "--order", "album", "--dry-run"])
+    printed = capsys.readouterr().out
+    assert "Order :" not in printed and "In file" not in printed
+
+
+def test_album_in_order_is_not_reordered(tmp_path, mock_mb_order, capsys):
+    src = str(tmp_path / "album.m4a")
+    make_shuffled_album(src, [0, 1, 2])
+    sa.main([src, "--release-id", "rel-o", "--dry-run"])
+    printed = capsys.readouterr().out
+    assert "Cuts  : 2 of 2 moved to a silence" in printed and "Order :" not in printed
+
+
+# ---- end to end: album from file name, tracklists ---------------------------
+
+def test_album_from_file_name(tmp_path, mock_mb, monkeypatch, capsys):
+    queries = []
+    real = sa.mb_get
+
+    def spy(path, params):
+        queries.append(params.get("query"))
+        return real(path, params)
+
+    monkeypatch.setattr(sa, "mb_get", spy)
+    src = str(tmp_path / "Tone Makers - Synth Album (2019) [Full Album].m4a")
+    make_album(src, ["-c:a", "aac"])
+    sa.main([src, "--dry-run"])
+    assert 'release:"Synth Album" AND artist:"Tone Makers"' in queries
+    assert "(from the file name)" in capsys.readouterr().out
+
+
+def test_no_album_info_is_an_error(tmp_path, mock_mb):
+    src = str(tmp_path / "album.m4a")
+    make_album(src, ["-c:a", "aac"])
+    with pytest.raises(SystemExit, match="cannot tell the artist and album"):
+        sa.main([src])
+
+
+def no_network(monkeypatch):
+    def boom(*a, **k):
+        raise AssertionError("no network calls expected")
+    monkeypatch.setattr(sa, "mb_get", boom)
+    monkeypatch.setattr(sa, "fetch_cover", boom)
+
+
+def test_end_to_end_cue_sheet(tmp_path, monkeypatch):
+    no_network(monkeypatch)
+    src = str(tmp_path / "album.mp3")
+    make_album(src, ["-c:a", "libmp3lame"])
+    cue = tmp_path / "album.cue"
+    cue.write_text('PERFORMER "Cue Band"\nTITLE "Cue Album"\nREM DATE 2001\n'
+                   'FILE "album.wav" WAVE\n'
+                   '  TRACK 01 AUDIO\n    TITLE "One"\n    INDEX 01 00:00:00\n'
+                   '  TRACK 02 AUDIO\n    TITLE "Two"\n    INDEX 01 00:02:60\n'   # 2.8 s
+                   '  TRACK 03 AUDIO\n    TITLE "Three"\n    INDEX 01 00:08:15\n',  # 8.2 s
+                   encoding="utf-8")
+    out = tmp_path / "out"
+    sa.main([src, "--tracklist", str(cue), "-o", str(out), "--format", "md,json"])
+    data = json.loads((out / "tracks.json").read_text(encoding="utf-8"))
+    assert [t["start_seconds"] for t in data["tracks"]] == [0, 2.8, 8.2]
+    assert [t["cut"] for t in data["tracks"]] == ["cue", "cue", "end"]
+    assert data["album"]["musicbrainz_release_id"] is None
+    assert data["album"]["metadata_source"] == "tracklist"
+    from mutagen.id3 import ID3
+    tags = ID3(str(out / "02 - Two.mp3"))
+    assert str(tags["TIT2"]) == "Two" and str(tags["TPE1"]) == "Cue Band"
+    assert str(tags["TALB"]) == "Cue Album" and str(tags["TDRC"]) == "2001"
+    assert not tags.getall("TXXX") and not tags.getall("UFID")
+    md = (out / "tracks.md").read_text(encoding="utf-8")
+    assert "Track data: tracklist" in md and "musicbrainz.org" not in md
+
+
+def test_end_to_end_txt_tracklist_snaps(tmp_path, monkeypatch):
+    no_network(monkeypatch)
+    src = str(tmp_path / "album.m4a")
+    make_album(src, ["-c:a", "aac"])                     # real cuts at 3.0 and 8.0
+    txt = tmp_path / "tracks.txt"
+    txt.write_text("0:00 Intro\n0:04 Middle\n0:07 Outro\n", encoding="utf-8")
+    out = tmp_path / "out"
+    sa.main([src, "--tracklist", str(txt), "--artist", "Me", "--album", "Mine",
+             "-o", str(out), "--format", "json"])
+    data = json.loads((out / "tracks.json").read_text(encoding="utf-8"))
+    assert [t["start_seconds"] for t in data["tracks"]] == pytest.approx([0, 3.0, 8.0],
+                                                                         abs=0.05)
+    assert [t["cut"] for t in data["tracks"]] == ["silence", "silence", "end"]
