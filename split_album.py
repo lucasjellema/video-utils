@@ -79,6 +79,7 @@ Requires ffmpeg (see cut_video.py) and mutagen (pip install mutagen).
 """
 
 import argparse
+import http.client
 import json
 import os
 import re
@@ -179,6 +180,16 @@ class Release:
 _last_mb_call = 0.0
 
 
+# A timeout while reading a response is a bare TimeoutError, not a URLError, and a
+# dropped connection is an http.client exception; neither may crash the program.
+NETWORK_ERRORS = (OSError, http.client.HTTPException)
+
+
+def net_reason(exc: Exception) -> str:
+    """Short description of a network failure."""
+    return str(getattr(exc, "reason", None) or exc) or type(exc).__name__
+
+
 def mb_get(path: str, params: dict) -> dict:
     """GET a MusicBrainz JSON resource; respects the 1 request/second limit."""
     global _last_mb_call
@@ -201,8 +212,11 @@ def mb_get(path: str, params: dict) -> dict:
             if exc.code == 404:
                 raise LookupError(f"not found in MusicBrainz: {path}") from exc
             raise RuntimeError(f"MusicBrainz request failed ({exc.code}): {url}") from exc
-        except urllib.error.URLError as exc:
-            raise RuntimeError(f"cannot reach MusicBrainz: {exc.reason}") from exc
+        except NETWORK_ERRORS as exc:
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise RuntimeError(f"cannot reach MusicBrainz: {net_reason(exc)}") from exc
     raise RuntimeError("MusicBrainz keeps refusing requests (rate limit); try again later")
 
 
@@ -383,18 +397,28 @@ def parse_release(data: dict) -> Release:
 # Cover art (Cover Art Archive)
 # --------------------------------------------------------------------------- #
 
+HTTP_ATTEMPTS = 2
+HTTP_RETRY_WAIT_S = 2
+
+
 def http_get_bytes(url: str) -> bytes | None:
-    """GET a URL (following redirects); None on 404."""
+    """GET a URL (following redirects); None on 404. Retries once on a temporary failure."""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise RuntimeError(f"download failed ({exc.code}): {url}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"cannot reach {url}: {exc.reason}") from exc
+    for attempt in range(HTTP_ATTEMPTS):
+        retry = attempt < HTTP_ATTEMPTS - 1
+        try:
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                return resp.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                return None
+            if exc.code < 500 or not retry:
+                raise RuntimeError(f"download failed ({exc.code}): {url}") from exc
+        except NETWORK_ERRORS as exc:
+            if not retry:
+                raise RuntimeError(f"cannot reach {url}: {net_reason(exc)}") from exc
+        time.sleep(HTTP_RETRY_WAIT_S)
+    return None
 
 
 def image_type(data: bytes) -> str | None:
@@ -412,10 +436,17 @@ def fetch_cover(release: Release, size: str = "500") -> bytes | None:
     urls = [f"{CAA_API}/release/{release.id}/{suffix}"]
     if release.release_group_id:
         urls.append(f"{CAA_API}/release-group/{release.release_group_id}/{suffix}")
+    error = None
     for url in urls:
-        data = http_get_bytes(url)
+        try:
+            data = http_get_bytes(url)
+        except RuntimeError as exc:        # the next URL may still work
+            error = exc
+            continue
         if data and image_type(data):
             return data
+    if error:
+        raise error
     return None
 
 
@@ -1309,8 +1340,8 @@ def acoustid_lookup(key: str, fp: str, duration: float) -> list[tuple[float, str
             data = json.load(exc)
         except Exception:
             raise RuntimeError(f"AcoustID request failed ({exc.code})") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"cannot reach AcoustID: {exc.reason}") from exc
+    except NETWORK_ERRORS as exc:
+        raise RuntimeError(f"cannot reach AcoustID: {net_reason(exc)}") from exc
     if data.get("status") != "ok":
         raise RuntimeError("AcoustID: " + data.get("error", {}).get("message", "lookup failed"))
     hits = [(r.get("score", 0.0), rec["id"]) for r in data.get("results", [])

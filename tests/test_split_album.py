@@ -1094,3 +1094,98 @@ def test_missing_mutagen_stops_before_any_work(tmp_path, monkeypatch):
     src.write_bytes(b"not audio")                      # never read: check comes first
     with pytest.raises(SystemExit, match="-m pip install mutagen"):
         sa.main([str(src), "--artist", "a", "--album", "b"])
+
+
+# --------------------------------------------------------------------------- #
+# Network failures
+# --------------------------------------------------------------------------- #
+
+class BytesResponse:
+    def __init__(self, body):
+        self.body = body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def read(self, *args):
+        return self.body
+
+
+def fake_urlopen(monkeypatch, outcomes):
+    """urlopen that raises or returns the given outcomes in turn; returns the call log."""
+    calls = []
+
+    def opener(req, timeout=None):
+        calls.append(req.full_url)
+        outcome = outcomes[len(calls) - 1]
+        if isinstance(outcome, Exception):
+            raise outcome
+        return BytesResponse(outcome)
+
+    monkeypatch.setattr(sa.urllib.request, "urlopen", opener)
+    monkeypatch.setattr(sa.time, "sleep", lambda s: None)
+    return calls
+
+
+@pytest.mark.parametrize("error", [
+    TimeoutError("The read operation timed out"),
+    ConnectionResetError("reset"),
+    sa.http.client.RemoteDisconnected("closed"),
+    sa.urllib.error.URLError("no route"),
+])
+def test_http_get_retries_then_reports_network_errors(monkeypatch, error):
+    calls = fake_urlopen(monkeypatch, [error, error])
+    with pytest.raises(RuntimeError, match="cannot reach"):
+        sa.http_get_bytes("https://example.org/x")
+    assert len(calls) == 2
+
+
+def test_http_get_recovers_after_timeout(monkeypatch):
+    fake_urlopen(monkeypatch, [TimeoutError("timed out"), b"data"])
+    assert sa.http_get_bytes("https://example.org/x") == b"data"
+
+
+def http_error(code):
+    return sa.urllib.error.HTTPError("https://example.org/x", code, "err", {}, None)
+
+
+def test_http_get_retries_server_errors_not_client_errors(monkeypatch):
+    calls = fake_urlopen(monkeypatch, [http_error(502), b"data"])
+    assert sa.http_get_bytes("https://example.org/x") == b"data"
+    assert len(calls) == 2
+
+    calls = fake_urlopen(monkeypatch, [http_error(403)])
+    with pytest.raises(RuntimeError, match="403"):
+        sa.http_get_bytes("https://example.org/x")
+    assert len(calls) == 1
+
+
+def test_fetch_cover_tries_release_group_after_failure(monkeypatch):
+    def fake_get(url):
+        if "/release-group/" in url:
+            return FAKE_JPEG
+        raise RuntimeError("cannot reach")
+
+    monkeypatch.setattr(sa, "http_get_bytes", fake_get)
+    r = sa.Release("r", "t", "a", [], "", "", "g", make_tracks(1))
+    assert sa.fetch_cover(r) == FAKE_JPEG
+
+
+def test_fetch_cover_reports_failure_when_all_urls_fail(monkeypatch):
+    def fake_get(url):
+        raise RuntimeError("cannot reach")
+
+    monkeypatch.setattr(sa, "http_get_bytes", fake_get)
+    with pytest.raises(RuntimeError, match="cannot reach"):
+        sa.fetch_cover(sa.Release("r", "t", "a", [], "", "", "g", make_tracks(1)))
+
+
+def test_mb_get_turns_read_timeout_into_runtime_error(monkeypatch):
+    error = TimeoutError("The read operation timed out")
+    calls = fake_urlopen(monkeypatch, [error, error, error])
+    with pytest.raises(RuntimeError, match="cannot reach MusicBrainz"):
+        sa.mb_get("release/x", {})
+    assert len(calls) == 3
